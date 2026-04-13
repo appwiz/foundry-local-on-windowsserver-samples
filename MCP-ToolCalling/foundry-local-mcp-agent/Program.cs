@@ -1,4 +1,5 @@
 ﻿using Microsoft.AI.Foundry.Local;
+using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
@@ -20,13 +21,49 @@ var config = new Configuration
     }
 };
 
+using var loggerFactory = LoggerFactory.Create(builder =>
+{
+    builder.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information);
+});
 
 // Initialize the singleton instance.
-await FoundryLocalManager.CreateAsync(config, Utils.GetAppLogger());
+await FoundryLocalManager.CreateAsync(config, loggerFactory.CreateLogger("foundry-local-mcp-agent"));
 var mgr = FoundryLocalManager.Instance;
 
-// Ensure that any Execution Provider (EP) downloads run and are completed.
-await Utils.RunWithSpinner("Registering execution providers", mgr.EnsureEpsDownloadedAsync());
+// Discover available execution providers and their registration status.
+var eps = mgr.DiscoverEps();
+int maxNameLen = 30;
+Console.WriteLine("Available execution providers:");
+Console.WriteLine($"  {"Name".PadRight(maxNameLen)}  Registered");
+Console.WriteLine($"  {new string('─', maxNameLen)}  {"──────────"}");
+foreach (var ep in eps)
+{
+    Console.WriteLine($"  {ep.Name.PadRight(maxNameLen)}  {ep.IsRegistered}");
+}
+
+// Download and register all execution providers with per-EP progress.
+// EP packages include dependencies and may be large.
+// Download is only required again if a new version of the EP is released.
+// For cross platform builds there is no dynamic EP download and this will return immediately.
+Console.WriteLine("\nDownloading execution providers:");
+if (eps.Length > 0)
+{
+    var currentEp = "";
+    await mgr.DownloadAndRegisterEpsAsync((epName, percent) =>
+    {
+        if (epName != currentEp)
+        {
+            if (currentEp != "") Console.WriteLine();
+            currentEp = epName;
+        }
+        Console.Write($"\r  {epName.PadRight(maxNameLen)}  {percent,6:F1}%");
+    });
+    if (currentEp != "") Console.WriteLine();
+}
+else
+{
+    Console.WriteLine("No execution providers to download.");
+}
 
 // Get the model catalog
 var catalog = await mgr.GetCatalogAsync();
@@ -52,8 +89,6 @@ Console.WriteLine("done.");
 Console.Write($"Starting web service on {config.Web.Urls}...");
 await mgr.StartWebServiceAsync();
 Console.WriteLine("done.");
-
-
 
 
 // Step 2: Initialize MCP client and connect to weather server
@@ -83,19 +118,18 @@ catch (Exception ex)
 }
 
 
-// Step 3: Create Semantic Kernel with OpenAI-compatible endpoint
+// Step 3: Create Semantic Kernel with OpenAI-compatible endpoint and add Weather MCP Plugin
 var builder = Kernel.CreateBuilder().AddOpenAIChatCompletion(
     modelId: model.Id,
     endpoint: new Uri(foundryLocalWebUrl + "/v1"),
     apiKey: "not needed");
 
-// Step 4: Add Weather MCP Plugin
 builder.Plugins.AddFromObject(new WeatherMcpPlugin(mcpClient), "Weather");
 
-// Step 5: Build the Kernel
 var kernel = builder.Build();
 
-// Step 6: Create chat history and get chat service
+
+// Step 4: Create chat history and get chat service
 var history = new ChatHistory();
 history.AddSystemMessage(@"You are a helpful weather assistant. You have access to weather tools that can:
 1. Get weather alerts for US states (use two-letter state codes like CA, NY, TX)
@@ -109,11 +143,10 @@ Some common coordinates:
 - Chicago: 41.8781, -87.6298
 - Miami: 25.7617, -80.1918");
 
-
 var chatService = kernel.GetRequiredService<IChatCompletionService>();
 
 
-// Step 7: Interactive chat loop
+// Step 5: Interactive chat loop
 Console.WriteLine("Chat with the Weather Assistant (type 'exit' to quit)");
 Console.WriteLine("Try asking questions like:");
 Console.WriteLine("  - What are the weather alerts in California?");
