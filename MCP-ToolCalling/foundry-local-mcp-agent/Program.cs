@@ -1,13 +1,13 @@
-﻿using Microsoft.AI.Foundry.Local;
+using Microsoft.AI.Foundry.Local;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.OpenAI;
 using ModelContextProtocol.Client;
-using System.Text;
+using OpenAI;
+using System.ClientModel;
 
 
-var alias = "qwen2.5-7b";
+var alias = args.FirstOrDefault(a => !string.IsNullOrWhiteSpace(a))?.Trim() ?? "qwen2.5-7b";
+var ct = CancellationToken.None;
 var foundryLocalWebUrl = "http://127.0.0.1:9001";
 
 
@@ -86,8 +86,8 @@ Console.Write($"Loading model {model.Id}...");
 await model.LoadAsync();
 Console.WriteLine("done.");
 
-// Start the web service
-Console.Write($"Starting web service on {config.Web.Urls}...");
+// Start the OpenAI-compatible web service
+Console.Write($"Starting web service on {foundryLocalWebUrl}...");
 await mgr.StartWebServiceAsync();
 Console.WriteLine("done.");
 
@@ -113,20 +113,29 @@ foreach (var tool in tools)
 Console.WriteLine();
 
 
-// Step 3: Create Semantic Kernel with OpenAI-compatible endpoint and add Weather MCP Plugin
-var builder = Kernel.CreateBuilder().AddOpenAIChatCompletion(
-    modelId: model.Id,
-    endpoint: new Uri(foundryLocalWebUrl + "/v1"),
-    apiKey: "not needed");
+// Step 3: Build a function-invoking chat client over Foundry Local's OpenAI-compatible endpoint.
+// MCP tools are already AIFunctions, so they plug in directly and are invoked automatically by UseFunctionInvocation().
+// Non-streaming GetResponseAsync is used because Foundry Local only populates structured tool calls on non-streaming responses.
+var openAIClient = new OpenAIClient(
+    new ApiKeyCredential("not-needed"),
+    new OpenAIClientOptions { Endpoint = new Uri($"{foundryLocalWebUrl}/v1") });
 
-builder.Plugins.AddFromFunctions("WeatherMCP", tools.Select(t => t.AsKernelFunction()));
+IChatClient chatClient = openAIClient
+    .GetChatClient(model.Id)
+    .AsIChatClient()
+    .AsBuilder()
+    .UseFunctionInvocation()
+    .Build();
 
-var kernel = builder.Build();
+var options = new ChatOptions
+{
+    Tools = [.. tools],
+    Temperature = 0.1f
+};
 
-
-// Step 4: Create chat history and get chat service
-var history = new ChatHistory();
-history.AddSystemMessage(@"You are a helpful weather assistant. You have access to weather tools that can:
+var messages = new List<ChatMessage>
+{
+    new(ChatRole.System, @"You are a helpful weather assistant. You have access to weather tools that can:
 1. Get weather alerts for US states (use two-letter state codes like CA, NY, TX)
 2. Get weather forecasts for locations using latitude and longitude coordinates
 
@@ -136,12 +145,11 @@ Some common coordinates:
 - New York: 40.7128, -74.0060
 - Los Angeles: 34.0522, -118.2437
 - Chicago: 41.8781, -87.6298
-- Miami: 25.7617, -80.1918");
+- Miami: 25.7617, -80.1918")
+};
 
-var chatService = kernel.GetRequiredService<IChatCompletionService>();
 
-
-// Step 5: Interactive chat loop
+// Step 4: Interactive chat loop
 Console.WriteLine("Chat with the Weather Assistant (type 'exit' to quit)");
 Console.WriteLine("Try asking questions like:");
 Console.WriteLine("  - What are the weather alerts in California?");
@@ -162,30 +170,21 @@ while (prompt.CompareTo("exit") != 0)
     if (string.IsNullOrWhiteSpace(prompt))
         continue;
 
-    history.AddUserMessage(prompt);
-    StringBuilder fullResponse = new StringBuilder();
+    messages.Add(new(ChatRole.User, prompt));
 
     try
     {
-        var executionSettings = new OpenAIPromptExecutionSettings()
-        {
-            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(),
-            Temperature = 0.1
-        };
+        // The function-invoking client handles the full tool loop: it calls the model,
+        // executes any requested MCP tools, feeds the results back, and returns the
+        // final grounded answer.
+        var response = await chatClient.GetResponseAsync(messages, options, ct);
 
-        // Stream the response with automatic tool invocation
-        await foreach (var response in chatService.GetStreamingChatMessageContentsAsync(
-            history,
-            executionSettings: executionSettings,
-            kernel: kernel
-        ))
-        {
-            fullResponse.Append(response.Content);
-            Console.Write(response.Content);
-        }
-
-        Console.WriteLine("\n");
-        history.AddAssistantMessage(fullResponse.ToString());
+        // Print only the final assistant message. response.Text concatenates every
+        // assistant turn, which would also include the intermediate tool-calling turn
+        // (some models, e.g. Qwen, echo the <tool_call> JSON as content there).
+        var answer = response.Messages.LastOrDefault(m => m.Role == ChatRole.Assistant)?.Text;
+        Console.WriteLine((string.IsNullOrWhiteSpace(answer) ? response.Text : answer) + "\n");
+        messages.AddMessages(response);
     }
     catch (Exception ex)
     {
@@ -194,8 +193,7 @@ while (prompt.CompareTo("exit") != 0)
 }
 
 
-// Tidy up
-// Stop the web service and unload model
+// Tidy up - disconnect MCP, stop the web service, and unload the model
 Console.WriteLine("Goodbye!");
 await mcpClient.DisposeAsync();
 await mgr.StopWebServiceAsync();
